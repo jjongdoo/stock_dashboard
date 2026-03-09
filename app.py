@@ -50,7 +50,7 @@ if ticker_symbol:
         fin_data = ticker.quarterly_financials
         bs_data = ticker.quarterly_balance_sheet
         cf_data = ticker.quarterly_cashflow
-        limit = 5  # 분기 데이터 최대 5개로 축소
+        limit = 5  # 분기 데이터 최대 5개
         date_format = '%Y-%m'
         title_suffix = "(분기별)"
 
@@ -96,7 +96,7 @@ if ticker_symbol:
     em = total_assets / equity.replace(0, np.nan)          
     dupont_roe = (npm / 100) * ato * em * 100              
 
-    # 절대금액 데이터프레임
+    # 🌟 CAPEX 추가된 절대금액 데이터프레임
     plot_data_abs = pd.DataFrame({
         '매출액': revenue,
         '영업이익': op_income,
@@ -104,6 +104,7 @@ if ticker_symbol:
         'CFO(영업활동)': get_data(df_cf, ['Operating Cash Flow']),
         'CFI(투자활동)': get_data(df_cf, ['Investing Cash Flow']),
         'CFF(재무활동)': get_data(df_cf, ['Financing Cash Flow']),
+        'CAPEX(자본적지출)': get_data(df_cf, ['Capital Expenditure']),
         'FCF(잉여현금)': get_data(df_cf, ['Free Cash Flow']),
         '총자산': total_assets,
         '총부채': total_liab,
@@ -138,7 +139,7 @@ if ticker_symbol:
     col_adv3.metric("ROIC", f"{latest_roic:.2f}%" if pd.notna(latest_roic) else "N/A")
     col_adv4.metric("공매도 비율", f"{short_ratio * 100:.2f}%" if short_ratio else "N/A")
 
-    # 🎯 섹션 3: 애널리스트 목표가 (다시 추가된 부분)
+    # 🎯 섹션 3: 애널리스트 목표가
     st.divider()
     st.subheader("🎯 월가 컨센서스 목표가")
     st.caption("※ 야후 파이낸스 제공 데이터 기준 (일부 한국 주식은 제공되지 않을 수 있습니다.)")
@@ -198,10 +199,13 @@ if ticker_symbol:
         st.plotly_chart(fig_profit, use_container_width=True)
 
     with col_chart2:
-        st.subheader(f"💸 현금흐름 분석")
+        st.subheader(f"💸 현금흐름 분석 (CAPEX 포함)")
         fig_cf = go.Figure()
-        for col in ['CFO(영업활동)', 'CFI(투자활동)', 'CFF(재무활동)', 'FCF(잉여현금)']:
-            fig_cf.add_trace(go.Scatter(x=plot_data_abs.index, y=plot_data_abs[col], name=col, mode='lines+markers'))
+        # 🌟 현금흐름 차트 범례에 CAPEX 추가
+        for col in ['CFO(영업활동)', 'CFI(투자활동)', 'CFF(재무활동)', 'CAPEX(자본적지출)', 'FCF(잉여현금)']:
+            # CAPEX는 잘 보이도록 점선(dash)으로 처리
+            line_style = dict(dash='dot', width=2) if col == 'CAPEX(자본적지출)' else dict(width=2)
+            fig_cf.add_trace(go.Scatter(x=plot_data_abs.index, y=plot_data_abs[col], name=col, mode='lines+markers', line=line_style))
         fig_cf.update_layout(xaxis_type='category', hovermode="x unified", legend=dict(orientation="h", y=-0.2))
         st.plotly_chart(fig_cf, use_container_width=True)
 
