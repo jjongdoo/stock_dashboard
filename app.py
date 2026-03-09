@@ -27,7 +27,7 @@ if ticker_symbol:
         divisor = 1_000_000
         unit_text = "백만 달러"
 
-    # 2. 현재 주가 가져오기
+    # 2. 현재 주가 및 포맷팅 함수
     try:
         current_price = ticker.history(period="1d")['Close'].iloc[-1]
     except:
@@ -38,7 +38,7 @@ if ticker_symbol:
             return "N/A"
         return f"{price:,.0f}" if price > 1000 else f"{price:,.2f}"
 
-    # 3. 데이터 불러오기 (재무제표, 대차대조표, 현금흐름표)
+    # 3. 데이터 불러오기
     if period_option == "연간 (최근 3년)":
         fin_data = ticker.financials
         bs_data = ticker.balance_sheet
@@ -54,7 +54,7 @@ if ticker_symbol:
         date_format = '%Y-%m'
         title_suffix = "(분기별)"
 
-    # 데이터 추출 및 시간순 정렬 (과거가 왼쪽)
+    # 데이터 추출 및 시간순 정렬
     df_fin = fin_data.iloc[:, :limit].T.sort_index()
     df_bs = bs_data.iloc[:, :limit].T.sort_index()
     df_cf = cf_data.iloc[:, :limit].T.sort_index()
@@ -86,22 +86,17 @@ if ticker_symbol:
         invested_capital = equity + get_data(df_bs, ['Total Debt'])
 
     # --- 신규 지표 계산 ---
-    # 1. 부채비율 = (총부채 / 자본총계) * 100
     debt_ratio = (total_liab / equity.replace(0, np.nan)) * 100
-    
-    # 2. 이자보상배율 = 영업이익 / 이자비용
     interest_cov = op_income / interest_exp.replace(0, np.nan)
-    
-    # 3. ROIC (투하자본수익률) = 영업이익 / 투하자본
     roic = (op_income / invested_capital.replace(0, np.nan)) * 100
 
-    # 4. 듀퐁 분석 요소
-    npm = (net_income / revenue.replace(0, np.nan)) * 100  # 순이익률 (%)
-    ato = revenue / total_assets.replace(0, np.nan)        # 총자산회전율 (배)
-    em = total_assets / equity.replace(0, np.nan)          # 자기자본승수 (배)
-    dupont_roe = (npm / 100) * ato * em * 100              # 분해된 ROE (%)
+    # 듀퐁 분석 요소
+    npm = (net_income / revenue.replace(0, np.nan)) * 100  
+    ato = revenue / total_assets.replace(0, np.nan)        
+    em = total_assets / equity.replace(0, np.nan)          
+    dupont_roe = (npm / 100) * ato * em * 100              
 
-    # 화면에 보여줄 절대금액 데이터프레임 (단위 나누기 적용)
+    # 절대금액 데이터프레임
     plot_data_abs = pd.DataFrame({
         '매출액': revenue,
         '영업이익': op_income,
@@ -115,7 +110,7 @@ if ticker_symbol:
         '자본총계': equity
     }) / divisor
 
-    # 화면 출력 시작
+    # --- 화면 출력 시작 ---
     company_name = stats.get('longName', ticker_symbol)
     st.markdown(f"## **{company_name} ({ticker_symbol})**")
 
@@ -133,7 +128,6 @@ if ticker_symbol:
     st.subheader("🛡️ 재무 건전성 및 수익성 (최근 기준)")
     col_adv1, col_adv2, col_adv3, col_adv4 = st.columns(4)
     
-    # 최근 데이터의 값을 가져옴
     latest_debt = debt_ratio.iloc[-1] if not debt_ratio.empty else np.nan
     latest_icov = interest_cov.iloc[-1] if not interest_cov.empty else np.nan
     latest_roic = roic.iloc[-1] if not roic.empty else np.nan
@@ -144,12 +138,27 @@ if ticker_symbol:
     col_adv3.metric("ROIC", f"{latest_roic:.2f}%" if pd.notna(latest_roic) else "N/A")
     col_adv4.metric("공매도 비율", f"{short_ratio * 100:.2f}%" if short_ratio else "N/A")
 
-    # 🌳 섹션 3: 듀퐁 분석 (DuPont Analysis)
+    # 🎯 섹션 3: 애널리스트 목표가 (다시 추가된 부분)
+    st.divider()
+    st.subheader("🎯 월가 컨센서스 목표가")
+    st.caption("※ 야후 파이낸스 제공 데이터 기준 (일부 한국 주식은 제공되지 않을 수 있습니다.)")
+    col_tgt1, col_tgt2, col_tgt3, col_tgt4 = st.columns(4)
+
+    target_mean = stats.get('targetMeanPrice', None)
+    target_high = stats.get('targetHighPrice', None)
+    target_low = stats.get('targetLowPrice', None)
+    analyst_cnt = stats.get('numberOfAnalystOpinions', None)
+
+    col_tgt1.metric("평균 목표가", format_price(target_mean))
+    col_tgt2.metric("최고 목표가", format_price(target_high))
+    col_tgt3.metric("최저 목표가", format_price(target_low))
+    col_tgt4.metric("분석가 수", f"{analyst_cnt}명" if analyst_cnt else "N/A")
+
+    # 🌳 섹션 4: 듀퐁 분석 (DuPont Analysis)
     st.divider()
     st.subheader(f"🔬 듀퐁 분석 (ROE 분해) {title_suffix}")
     st.markdown("기업의 자기자본이익률(ROE)이 **마진(순이익률), 효율성(총자산회전율), 레버리지(자기자본승수)** 중 어디서 비롯되었는지 파악합니다.")
 
-    # 최근 분기 듀퐁 트리 시각화
     latest_npm = npm.iloc[-1] if not npm.empty else 0
     latest_ato = ato.iloc[-1] if not ato.empty else 0
     latest_em = em.iloc[-1] if not em.empty else 0
@@ -164,19 +173,18 @@ if ticker_symbol:
     col_sign3.markdown("<h2 style='text-align: center;'>×</h2>", unsafe_allow_html=True)
     col_d4.metric("자기자본승수 (레버리지)", f"{latest_em:.2f}배")
 
-    # 듀퐁 분석 추이 차트
     fig_dupont = make_subplots(specs=[[{"secondary_y": True}]])
     fig_dupont.add_trace(go.Bar(x=dupont_roe.index, y=dupont_roe, name='ROE (%)', opacity=0.6, marker_color='indigo'), secondary_y=False)
     fig_dupont.add_trace(go.Scatter(x=npm.index, y=npm, name='순이익률 (%)', mode='lines+markers', line=dict(color='green', width=2)), secondary_y=False)
     fig_dupont.add_trace(go.Scatter(x=ato.index, y=ato, name='총자산회전율 (배)', mode='lines+markers', line=dict(color='orange', width=2)), secondary_y=True)
     fig_dupont.add_trace(go.Scatter(x=em.index, y=em, name='자기자본승수 (배)', mode='lines+markers', line=dict(color='red', width=2)), secondary_y=True)
     
-    fig_dupont.update_layout(title_text="최근 5개 분기 듀퐁 지표 추이", hovermode="x unified", barmode='group')
+    fig_dupont.update_layout(title_text="최근 기간 듀퐁 지표 추이", hovermode="x unified", barmode='group')
     fig_dupont.update_yaxes(title_text="비율 (%)", secondary_y=False)
     fig_dupont.update_yaxes(title_text="배수 (배)", secondary_y=True)
     st.plotly_chart(fig_dupont, use_container_width=True)
 
-    # --- 섹션 4: 수익성 & 현금흐름 차트 ---
+    # --- 섹션 5: 수익성 & 현금흐름 차트 ---
     st.divider()
     col_chart1, col_chart2 = st.columns(2)
     
