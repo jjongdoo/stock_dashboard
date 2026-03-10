@@ -6,18 +6,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pykrx import stock
 import datetime
-import os
 
 # 페이지 설정
 st.set_page_config(page_title="나의 주식 분석 대시보드", layout="wide")
 
-# 모바일 UI 최적화
+# 📱 모바일 UI 최적화 & 탭 스타일링
 st.markdown("""
     <style>
     .block-container { padding-top: 2rem; padding-bottom: 2rem; padding-left: 1rem; padding-right: 1rem; }
     [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
     .stDataFrame { width: 100%; }
-    /* 탭 디자인 스타일링 */
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 50px; font-weight: bold; font-size: 1.1rem; }
     </style>
@@ -27,8 +25,7 @@ st.markdown("""
 @st.cache_data
 def load_krx_mapping():
     try:
-        df = pd.read_csv('krx_mapping.csv', dtype={'Code': str})
-        return df
+        return pd.read_csv('krx_mapping.csv', dtype={'Code': str})
     except Exception:
         st.error("🚨 깃허브에서 krx_mapping.csv 파일을 찾을 수 없습니다. 파일 업로드를 확인해주세요.")
         return pd.DataFrame(columns=['Code', 'Name', 'Market'])
@@ -73,86 +70,79 @@ if user_input:
         if price is None or price == 'N/A' or price == 0 or pd.isna(price): return "N/A"
         return f"{price:,.0f}" if price > 1000 else f"{price:,.2f}"
 
-    # 날짜 세팅 (1년, 5년)
+    # 날짜 세팅
     today = datetime.datetime.today()
     end_date_today = today.strftime("%Y%m%d")
     start_date_7d = (today - datetime.timedelta(days=7)).strftime("%Y%m%d")
     start_date_1y = (today - datetime.timedelta(days=365)).strftime("%Y%m%d")
-    start_date_5y = (today - datetime.timedelta(days=365*5)).strftime("%Y%m%d")
+    
+    # 🌟 연간 선택 시 3년 밴드, 분기 선택 시 5년 밴드를 위한 날짜 분기 처리
+    if "연간" in period_option:
+        start_val_date = (today - datetime.timedelta(days=365*3)).strftime("%Y%m%d")
+        band_title = "3년"
+    else:
+        start_val_date = (today - datetime.timedelta(days=365*5)).strftime("%Y%m%d")
+        band_title = "5년"
 
-    # 🚀 핵심 데이터 캐싱 함수 (로딩 속도 대폭 개선)
+    # 🚀 데이터 로딩 (캐싱을 통한 속도 최적화)
     @st.cache_data(ttl=3600)
-    def get_stock_data(symbol, pure_sym, is_kr, mkt):
+    def get_stock_data(symbol, pure_sym, is_kr, val_start):
         hist_1y = yf.Ticker(symbol).history(period="1y")
-        krx_fund_5y = pd.DataFrame()
-        krx_fund_current = {}
+        krx_fund_val, krx_fund_current = pd.DataFrame(), {}
         
         if is_kr:
             try:
-                # 5년치 KRX 펀더멘털 데이터 (PER, PBR 밴드용)
-                krx_fund_5y = stock.get_market_fundamental(start_date_5y, end_date_today, pure_sym)
-                # 최근 7일 중 가장 최근 펀더멘털
+                # 밸류에이션 밴드용 (월간 간격으로 조회하여 로딩 최적화)
+                krx_fund_val = stock.get_market_fundamental(val_start, end_date_today, pure_sym, freq="m")
                 recent_fund = stock.get_market_fundamental(start_date_7d, end_date_today, pure_sym)
                 if not recent_fund.empty:
                     krx_fund_current = recent_fund.iloc[-1].to_dict()
             except:
                 pass
-                
-        return hist_1y, krx_fund_5y, krx_fund_current
+        return hist_1y, krx_fund_val, krx_fund_current
 
     @st.cache_data(ttl=3600)
     def get_benchmark_data(is_kr, mkt):
-        if is_kr:
-            bench_sym = "^KS11" if mkt in ['KOSPI', 'KOSPI200'] else "^KQ11"
-        else:
-            bench_sym = "^GSPC" # S&P 500
+        bench_sym = "^KS11" if is_kr and mkt in ['KOSPI', 'KOSPI200'] else "^KQ11" if is_kr else "^GSPC"
         bench_hist = yf.Ticker(bench_sym).history(period="1y")
-        try:
-            rfr = yf.Ticker("^TNX").history(period="1d")['Close'].iloc[-1] / 100
-        except:
-            rfr = 0.04
+        try: rfr = yf.Ticker("^TNX").history(period="1d")['Close'].iloc[-1] / 100
+        except: rfr = 0.04
         return bench_hist, rfr
 
     # 데이터 호출
-    hist_1y, krx_fund_5y, krx_fund_current = get_stock_data(ticker_symbol, pure_ticker, is_korean, market)
+    hist_1y, krx_fund_val, krx_fund_current = get_stock_data(ticker_symbol, pure_ticker, is_korean, start_val_date)
     bench_hist, rfr = get_benchmark_data(is_korean, market)
 
     current_price = stats.get('currentPrice', hist_1y['Close'].iloc[-1] if not hist_1y.empty else 0)
 
-    # 2. 파이썬 자체 연산 로직 (Beta, Sharpe, CAPM, ROE)
+    # 파이썬 자체 연산 (Beta, Sharpe, CAPM)
     disp_per, disp_pbr, disp_roe, beta, sharpe_ratio, capm_return = "N/A", "N/A", "N/A", np.nan, np.nan, None
-    mrp = 0.055 
-
     if not hist_1y.empty and not bench_hist.empty:
-        # 일간 수익률 계산
         daily_ret = hist_1y['Close'].pct_change().dropna()
         bench_ret = bench_hist['Close'].pct_change().dropna()
         
-        # 샤프 지수 계산
         ann_return = daily_ret.mean() * 252
         ann_vol = daily_ret.std() * np.sqrt(252)
         sharpe_ratio = (ann_return - rfr) / ann_vol if ann_vol != 0 else np.nan
         
-        # 공분산/분산을 이용한 자체 Beta 계산 (야후 데이터 누락 완벽 커버)
         ret_df = pd.concat([daily_ret, bench_ret], axis=1).dropna()
         ret_df.columns = ['Stock', 'Bench']
         if not ret_df.empty:
             cov_mat = ret_df.cov()
             beta = cov_mat.iloc[0, 1] / cov_mat.iloc[1, 1]
-            capm_return = rfr + (beta * mrp)
+            capm_return = rfr + (beta * 0.055)
 
-    # PER, PBR, ROE 세팅
     if is_korean and krx_fund_current:
         disp_per = krx_fund_current.get('PER', "N/A")
         disp_pbr = krx_fund_current.get('PBR', "N/A")
         if disp_per != "N/A" and disp_per > 0 and disp_pbr != "N/A":
-            disp_roe = disp_pbr / disp_per # PBR / PER = ROE 역산
+            disp_roe = disp_pbr / disp_per 
     else:
         disp_per = stats.get('trailingPE', 'N/A')
         disp_pbr = stats.get('priceToBook', 'N/A')
         disp_roe = stats.get('returnOnEquity', "N/A")
 
-    # 3. yfinance 재무 데이터 불러오기
+    # yfinance 재무 데이터 불러오기
     if period_option == "연간 (최근 3년)":
         limit, date_format = 3, '%Y'
         df_fin = ticker.financials.iloc[:, :limit].T.sort_index() if not ticker.financials.empty else pd.DataFrame()
@@ -181,15 +171,26 @@ if user_input:
     total_assets = get_data(df_bs, ['Total Assets'])
     equity = get_data(df_bs, ['Stockholders Equity', 'Total Equity Gross Minority Interest'])
     
+    # 듀퐁 분석 요소
     npm = (net_income / revenue.replace(0, np.nan)) * 100  
     ato = revenue / total_assets.replace(0, np.nan)        
     em = total_assets / equity.replace(0, np.nan)          
     dupont_roe = (npm / 100) * ato * em * 100              
 
+    # 데이터 표 생성
+    plot_data_abs = pd.DataFrame({
+        '매출액': revenue, '영업이익': op_income, '순이익': net_income,
+        'CFO(영업활동)': get_data(df_cf, ['Operating Cash Flow']),
+        'CFI(투자활동)': get_data(df_cf, ['Investing Cash Flow']),
+        'CFF(재무활동)': get_data(df_cf, ['Financing Cash Flow']),
+        'CAPEX(자본적지출)': get_data(df_cf, ['Capital Expenditure']),
+        'FCF(잉여현금)': get_data(df_cf, ['Free Cash Flow'])
+    }) / divisor
+
     # --- 화면 출력 시작 ---
     st.markdown(f"## **{company_name} ({ticker_symbol})**")
 
-    # 기본 요약 지표 (최상단 고정)
+    # 기본 요약 지표 (최상단)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("현재 주가", format_price(current_price))
     col2.metric("현재 PER", f"{disp_per:.2f}" if isinstance(disp_per, (int, float)) and disp_per > 0 else "N/A")
@@ -198,8 +199,8 @@ if user_input:
 
     st.divider()
 
-    # 🌟 탭(Tabs) UI 생성 
-    tab1, tab2, tab3 = st.tabs(["📊 가격 & 재무 차트", "📈 밸류에이션 (5년 밴드)", "⚖️ 리스크 & 모멘텀"])
+    # 🌟 탭(Tabs) 분리
+    tab1, tab2, tab3 = st.tabs(["📊 가격 & 재무 차트", "📈 밸류에이션 & 목표가", "⚖️ 리스크 & 듀퐁 분석"])
 
     # --- TAB 1: 가격 & 재무 차트 ---
     with tab1:
@@ -222,47 +223,59 @@ if user_input:
             st.plotly_chart(fig_profit, use_container_width=True)
 
         with col_c2:
-            st.subheader(f"현금흐름 분석")
+            st.subheader(f"현금흐름 분석 (CAPEX 포함)")
             fig_cf = go.Figure()
             if not df_cf.empty:
-                for col_name, item in [('CFO(영업활동)', 'Operating Cash Flow'), ('CFI(투자활동)', 'Investing Cash Flow'), ('CFF(재무활동)', 'Financing Cash Flow'), ('FCF(잉여현금)', 'Free Cash Flow')]:
-                    fig_cf.add_trace(go.Scatter(x=df_cf.index, y=get_data(df_cf, [item])/divisor, name=col_name, mode='lines+markers'))
+                for col_name, item in [('CFO(영업활동)', 'Operating Cash Flow'), ('CFI(투자활동)', 'Investing Cash Flow'), ('CFF(재무활동)', 'Financing Cash Flow'), ('CAPEX(자본적지출)', 'Capital Expenditure'), ('FCF(잉여현금)', 'Free Cash Flow')]:
+                    line_style = dict(dash='dot', width=2) if col_name == 'CAPEX(자본적지출)' else dict(width=2)
+                    fig_cf.add_trace(go.Scatter(x=df_cf.index, y=get_data(df_cf, [item])/divisor, name=col_name, mode='lines+markers', line=line_style))
             fig_cf.update_layout(hovermode="x unified", legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig_cf, use_container_width=True)
 
-    # --- TAB 2: 밸류에이션 (5년 밴드) ---
+        # 🌟 상세 데이터 표 복구 (항상 보이거나 토글로 확인 가능)
+        with st.expander(f"상세 재무 데이터 보기 (단위: {unit_text})"):
+            st.dataframe(plot_data_abs.T.style.format("{:,.2f}"), use_container_width=True)
+
+    # --- TAB 2: 밸류에이션 및 애널리스트 목표가 ---
     with tab2:
-        if is_korean and not krx_fund_5y.empty:
-            st.subheader("📊 역사적 PER / PBR 밴드 (최근 5년)")
-            st.markdown("과거 5년 동안 주가가 기업가치 대비 프리미엄을 받았는지, 디스카운트를 받았는지 파악합니다.")
+        # 🌟 애널리스트 목표가
+        st.subheader("🎯 월가 컨센서스 목표가")
+        col_tgt1, col_tgt2, col_tgt3, col_tgt4 = st.columns(4)
+        target_mean = stats.get('targetMeanPrice', None)
+        col_tgt1.metric("평균 목표가", format_price(target_mean))
+        col_tgt2.metric("최고 목표가", format_price(stats.get('targetHighPrice', None)))
+        col_tgt3.metric("최저 목표가", format_price(stats.get('targetLowPrice', None)))
+        col_tgt4.metric("분석가 수", f"{stats.get('numberOfAnalystOpinions', 'N/A')}명")
+
+        st.divider()
+
+        # 🌟 3년/5년 동적 밴드 차트
+        if is_korean and not krx_fund_val.empty:
+            st.subheader(f"📊 역사적 PER / PBR 밴드 (최근 {band_title} 월간 추이)")
+            krx_fund_val = krx_fund_val.replace(0, np.nan)
             
-            # 0인 값(적자구간)을 nan으로 처리하여 차트 선이 바닥으로 내리꽂는 것을 방지
-            krx_fund_5y = krx_fund_5y.replace(0, np.nan)
-            
-            # PER 차트 (왼쪽 축), PBR 차트 (오른쪽 축) 이중축
             fig_val = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_val.add_trace(go.Scatter(x=krx_fund_5y.index, y=krx_fund_5y['PER'], name='PER (배)', mode='lines', line=dict(color='blue', width=1.5), opacity=0.8), secondary_y=False)
-            fig_val.add_trace(go.Scatter(x=krx_fund_5y.index, y=krx_fund_5y['PBR'], name='PBR (배)', mode='lines', line=dict(color='purple', width=1.5), opacity=0.8), secondary_y=True)
+            fig_val.add_trace(go.Scatter(x=krx_fund_val.index, y=krx_fund_val['PER'], name='PER (배)', mode='lines', line=dict(color='blue', width=2)), secondary_y=False)
+            fig_val.add_trace(go.Scatter(x=krx_fund_val.index, y=krx_fund_val['PBR'], name='PBR (배)', mode='lines', line=dict(color='purple', width=2)), secondary_y=True)
             
-            fig_val.update_layout(height=500, hovermode="x unified", margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", y=-0.2))
-            fig_val.update_yaxes(title_text="PER (배) - 파란색", secondary_y=False)
-            fig_val.update_yaxes(title_text="PBR (배) - 보라색", secondary_y=True)
+            fig_val.update_layout(height=450, hovermode="x unified", margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", y=-0.2))
+            fig_val.update_yaxes(title_text="PER (배)", secondary_y=False)
+            fig_val.update_yaxes(title_text="PBR (배)", secondary_y=True)
             st.plotly_chart(fig_val, use_container_width=True)
         else:
-            st.info("해당 종목은 5년 역사적 밸류에이션 데이터를 제공하지 않거나 미국 주식입니다.")
+            st.info("💡 미국 주식은 야후 파이낸스 무료 API 구조상 과거 장기 EPS/BPS를 불러올 수 없어 밸류에이션 밴드 차트가 생략됩니다.")
 
     # --- TAB 3: 리스크 & 듀퐁 분석 ---
     with tab3:
         st.subheader("⚖️ 리스크 및 성과 지표 (최근 1년 기준)")
-        st.markdown("벤치마크(KOSPI/KOSDAQ/S&P500) 대비 변동성과 리스크 프리미엄을 분석합니다.")
-        
         c_r1, c_r2, c_r3, c_r4 = st.columns(4)
-        c_r1.metric("베타 (Beta)", f"{beta:.2f}" if pd.notna(beta) else "N/A", help="1보다 크면 시장보다 변동성이 큼")
-        c_r2.metric("샤프 지수 (Sharpe)", f"{sharpe_ratio:.2f}" if pd.notna(sharpe_ratio) else "N/A", help="위험 대비 수익률")
+        c_r1.metric("베타 (Beta)", f"{beta:.2f}" if pd.notna(beta) else "N/A")
+        c_r2.metric("샤프 지수 (Sharpe)", f"{sharpe_ratio:.2f}" if pd.notna(sharpe_ratio) else "N/A")
         c_r3.metric("CAPM 기대수익률", f"{capm_return * 100:.2f}%" if capm_return is not None else "N/A")
         c_r4.metric("무위험 수익률 (10Y)", f"{rfr * 100:.2f}%")
 
         st.divider()
+
         st.subheader("🔬 듀퐁 분석 (ROE 분해)")
         latest_npm = npm.iloc[-1] if not npm.empty else 0
         latest_ato = ato.iloc[-1] if not ato.empty else 0
@@ -277,3 +290,16 @@ if user_input:
         col_d3.metric("총자산회전율 (효율성)", f"{latest_ato:.2f}배")
         col_sign3.markdown("<h3 style='text-align: center; margin-top: 10px;'>×</h3>", unsafe_allow_html=True)
         col_d4.metric("자기자본승수 (레버리지)", f"{latest_em:.2f}배")
+
+        # 🌟 듀퐁 분석 차트 복구
+        if not dupont_roe.empty:
+            fig_dupont = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_dupont.add_trace(go.Bar(x=dupont_roe.index, y=dupont_roe, name='ROE (%)', opacity=0.6, marker_color='indigo'), secondary_y=False)
+            fig_dupont.add_trace(go.Scatter(x=npm.index, y=npm, name='순이익률 (%)', mode='lines+markers', line=dict(color='green', width=2)), secondary_y=False)
+            fig_dupont.add_trace(go.Scatter(x=ato.index, y=ato, name='총자산회전율 (배)', mode='lines+markers', line=dict(color='orange', width=2)), secondary_y=True)
+            fig_dupont.add_trace(go.Scatter(x=em.index, y=em, name='자기자본승수 (배)', mode='lines+markers', line=dict(color='red', width=2)), secondary_y=True)
+            
+            fig_dupont.update_layout(height=400, hovermode="x unified", barmode='group', margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+            fig_dupont.update_yaxes(title_text="비율 (%)", secondary_y=False)
+            fig_dupont.update_yaxes(title_text="배수 (배)", secondary_y=True)
+            st.plotly_chart(fig_dupont, use_container_width=True)
