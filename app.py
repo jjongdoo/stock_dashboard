@@ -103,50 +103,62 @@ if user_input:
     @st.cache_data(ttl=3600)
     def build_band_data(pure_sym, val_start, val_end):
         """
-        pykrx로 월간 주가 + PER/PBR을 받아
-        EPS = 주가 ÷ PER, BPS = 주가 ÷ PBR을 역산하고
-        각 배수 밴드선을 계산해서 반환합니다.
-        반환: (DataFrame or None, error_message or None)
+        pykrx 일별 데이터를 받아 월말 기준으로 리샘플링 후
+        EPS = 종가 ÷ PER, BPS = 종가 ÷ PBR 역산 → 밴드선 계산
+        freq="m" 미사용: 버전 호환성 극대화
         """
+        import traceback
         try:
-            fund_m = stock.get_market_fundamental(val_start, val_end, pure_sym, freq="m")
-            if fund_m.empty:
-                return None, f"펀더멘털 데이터 없음 (코드: {pure_sym}, 기간: {val_start}~{val_end})"
+            # ① 일별 펀더멘털 (PER, PBR)
+            fund_d = stock.get_market_fundamental(val_start, val_end, pure_sym)
+            if fund_d is None or fund_d.empty:
+                return None, f"펀더멘털 데이터 없음 (코드={pure_sym}, {val_start}~{val_end})"
 
-            ohlcv_m = stock.get_market_ohlcv(val_start, val_end, pure_sym, freq="m")
-            if ohlcv_m.empty:
-                return None, f"주가 OHLCV 데이터 없음 (코드: {pure_sym})"
-
-            # 컬럼명 유연하게 처리 (pykrx 버전에 따라 다를 수 있음)
-            close_col = next((c for c in ['종가', 'Close', 'close'] if c in ohlcv_m.columns), None)
-            if close_col is None:
-                return None, f"종가 컬럼 없음. 실제 컬럼: {list(ohlcv_m.columns)}"
-
-            per_col = next((c for c in ['PER', 'per'] if c in fund_m.columns), None)
-            pbr_col = next((c for c in ['PBR', 'pbr'] if c in fund_m.columns), None)
+            # ② PER/PBR 컬럼 탐색
+            per_col = next((c for c in ['PER', 'per'] if c in fund_d.columns), None)
+            pbr_col = next((c for c in ['PBR', 'pbr'] if c in fund_d.columns), None)
             if per_col is None or pbr_col is None:
-                return None, f"PER/PBR 컬럼 없음. 실제 컬럼: {list(fund_m.columns)}"
+                return None, f"PER/PBR 컬럼 없음. 실제 컬럼: {list(fund_d.columns)}"
 
+            # ③ 일별 주가 OHLCV
+            ohlcv_d = stock.get_market_ohlcv(val_start, val_end, pure_sym)
+            if ohlcv_d is None or ohlcv_d.empty:
+                return None, f"OHLCV 데이터 없음 (코드={pure_sym})"
+
+            close_col = next((c for c in ['종가', 'Close', 'close'] if c in ohlcv_d.columns), None)
+            if close_col is None:
+                return None, f"종가 컬럼 없음. 실제 컬럼: {list(ohlcv_d.columns)}"
+
+            # ④ 병합 & 유효값 필터
             merged = pd.concat(
-                [ohlcv_m[[close_col]].rename(columns={close_col: '종가'}),
-                 fund_m[[per_col, pbr_col]].rename(columns={per_col: 'PER', pbr_col: 'PBR'})],
+                [ohlcv_d[[close_col]].rename(columns={close_col: '종가'}),
+                 fund_d[[per_col, pbr_col]].rename(columns={per_col: 'PER', pbr_col: 'PBR'})],
                 axis=1
             ).dropna()
             merged = merged[(merged['PER'] > 0) & (merged['PBR'] > 0)]
 
             if merged.empty:
-                return None, "PER/PBR 유효 데이터 없음 (0 또는 NaN만 존재)"
+                return None, "PER/PBR 유효 데이터 없음 (전부 0 또는 NaN)"
 
-            merged['EPS'] = merged['종가'] / merged['PER']
-            merged['BPS'] = merged['종가'] / merged['PBR']
-            merged['EPS_smooth'] = merged['EPS'].rolling(3, min_periods=1).mean()
-            merged['BPS_smooth'] = merged['BPS'].rolling(3, min_periods=1).mean()
+            # ⑤ 월말 기준 리샘플링 (ME: month end, 구버전 pandas는 M)
+            try:
+                merged_m = merged.resample('ME').last().dropna()
+            except Exception:
+                merged_m = merged.resample('M').last().dropna()
 
-            return merged, None
+            if merged_m.empty:
+                merged_m = merged  # 리샘플링 실패 시 일별 그대로 사용
+
+            # ⑥ EPS/BPS 역산 & 스무딩
+            merged_m['EPS'] = merged_m['종가'] / merged_m['PER']
+            merged_m['BPS'] = merged_m['종가'] / merged_m['PBR']
+            merged_m['EPS_smooth'] = merged_m['EPS'].rolling(3, min_periods=1).mean()
+            merged_m['BPS_smooth'] = merged_m['BPS'].rolling(3, min_periods=1).mean()
+
+            return merged_m, None
 
         except Exception as e:
-            import traceback
-            return None, f"예외 발생: {str(e)} | {traceback.format_exc()}"
+            return None, f"예외 발생: {str(e)}\n{traceback.format_exc()}"
 
     @st.cache_data(ttl=3600)
     def get_stock_data(symbol, pure_sym, is_kr, val_start):
@@ -155,17 +167,29 @@ if user_input:
 
         if is_kr:
             try:
-                krx_fund_val = stock.get_market_fundamental(val_start, end_date_today, pure_sym, freq="m")
+                # 최근 7일 펀더멘털 → 현재 PER/PBR/ROE
                 recent_fund = stock.get_market_fundamental(start_date_7d, end_date_today, pure_sym)
                 if not recent_fund.empty:
-                    krx_fund_current = recent_fund.iloc[-1].to_dict()
-            except:
+                    # 0값 제거 후 마지막 유효 행 사용
+                    valid = recent_fund[(recent_fund.get('PER', pd.Series([0])) > 0)]
+                    if not valid.empty:
+                        krx_fund_current = valid.iloc[-1].to_dict()
+                    else:
+                        krx_fund_current = recent_fund.iloc[-1].to_dict()
+            except Exception:
                 pass
+
+            try:
+                # 장기 일별 펀더멘털 (밴드 차트용 - freq="m" 미사용)
+                krx_fund_val = stock.get_market_fundamental(val_start, end_date_today, pure_sym)
+            except Exception:
+                pass
+
         return hist_1y, krx_fund_val, krx_fund_current
 
     @st.cache_data(ttl=3600)
     def get_benchmark_data(is_kr, mkt):
-        bench_sym = "^KS11" if is_kr and mkt in ['KOSPI', 'KOSPI200'] else "^KQ11" if is_kr else "^GSPC"
+        bench_sym = "^KS11" if is_kr and mkt == 'KOSPI' else "^KQ11" if is_kr and mkt == 'KOSDAQ' else "^GSPC"
         bench_hist = yf.Ticker(bench_sym).history(period="1y")
         try:
             rfr = yf.Ticker("^TNX").history(period="1d")['Close'].iloc[-1] / 100
