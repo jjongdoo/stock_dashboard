@@ -11,21 +11,9 @@ st.set_page_config(page_title="나의 주식 분석 대시보드", layout="wide"
 # 📱 모바일 UI 최적화를 위한 커스텀 CSS 주입
 st.markdown("""
     <style>
-    /* 상하단 여백 축소로 모바일 화면 활용도 극대화 */
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-        padding-left: 1rem;
-        padding-right: 1rem;
-    }
-    /* 모바일에서 주요 지표(Metric) 글씨 크기 적절히 조절 */
-    [data-testid="stMetricValue"] {
-        font-size: 1.6rem !important;
-    }
-    /* 테이블 모바일 스크롤 부드럽게 */
-    .stDataFrame {
-        width: 100%;
-    }
+    .block-container { padding-top: 2rem; padding-bottom: 2rem; padding-left: 1rem; padding-right: 1rem; }
+    [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
+    .stDataFrame { width: 100%; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -40,7 +28,7 @@ if ticker_symbol:
     ticker = yf.Ticker(ticker_symbol)
     stats = ticker.info
 
-    # 1. 한국 주식 vs 미국 주식 단위 설정
+    # 1. 한국/미국 주식 단위 설정
     is_korean = ticker_symbol.endswith('.KS') or ticker_symbol.endswith('.KQ')
     if is_korean:
         divisor = 100_000_000
@@ -49,18 +37,43 @@ if ticker_symbol:
         divisor = 1_000_000
         unit_text = "백만 달러"
 
-    # 2. 현재 주가 및 포맷팅 함수
-    try:
-        current_price = ticker.history(period="1d")['Close'].iloc[-1]
-    except:
-        current_price = stats.get('currentPrice', 0)
-
+    # 2. 주가 포맷팅 함수
     def format_price(price):
         if price is None or price == 'N/A' or price == 0 or pd.isna(price):
             return "N/A"
         return f"{price:,.0f}" if price > 1000 else f"{price:,.2f}"
 
-    # 3. 데이터 불러오기
+    # 3. 1년 주가 데이터 및 무위험 수익률(미국 10년물 국채) 가져오기
+    hist_1y = ticker.history(period="1y")
+    try:
+        current_price = hist_1y['Close'].iloc[-1]
+    except:
+        current_price = stats.get('currentPrice', 0)
+
+    try:
+        rfr_ticker = yf.Ticker("^TNX")
+        rfr = rfr_ticker.history(period="1d")['Close'].iloc[-1] / 100
+    except:
+        rfr = 0.04  # 데이터 수집 실패 시 기본값 4% 적용
+
+    # 4. 리스크 및 성과 지표 계산 (Sharpe, Beta, CAPM)
+    if not hist_1y.empty:
+        daily_returns = hist_1y['Close'].pct_change().dropna()
+        ann_return = daily_returns.mean() * 252
+        ann_vol = daily_returns.std() * np.sqrt(252)
+        sharpe_ratio = (ann_return - rfr) / ann_vol if ann_vol != 0 else np.nan
+    else:
+        sharpe_ratio = np.nan
+
+    beta = stats.get('beta', None)
+    mrp = 0.055  # 시장 위험 프리미엄 5.5% 가정
+    
+    if beta is not None and pd.notna(beta):
+        capm_return = rfr + (beta * mrp)
+    else:
+        capm_return = None
+
+    # 5. 재무 데이터 불러오기
     if period_option == "연간 (최근 3년)":
         fin_data = ticker.financials
         bs_data = ticker.balance_sheet
@@ -129,10 +142,29 @@ if ticker_symbol:
         '자본총계': equity
     }) / divisor
 
+    # --- 화면 출력 시작 ---
     company_name = stats.get('longName', ticker_symbol)
     st.markdown(f"## **{company_name} ({ticker_symbol})**")
 
-    # 📌 섹션 1
+    # 📈 섹션 1: 1년 캔들차트 (신규 추가)
+    if not hist_1y.empty:
+        fig_candle = go.Figure(data=[go.Candlestick(
+            x=hist_1y.index,
+            open=hist_1y['Open'],
+            high=hist_1y['High'],
+            low=hist_1y['Low'],
+            close=hist_1y['Close'],
+            name="주가"
+        )])
+        fig_candle.update_layout(
+            title="최근 1년 주가 추이 (Candlestick)",
+            xaxis_rangeslider_visible=False, # 하단 슬라이더 숨김 (모바일 가독성)
+            margin=dict(l=10, r=10, t=40, b=10),
+            height=400
+        )
+        st.plotly_chart(fig_candle, use_container_width=True)
+
+    # 📌 섹션 2: 기본 투자 지표
     st.subheader("📌 기본 투자 지표")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("현재 주가", format_price(current_price))
@@ -141,9 +173,19 @@ if ticker_symbol:
     roe_current = stats.get('returnOnEquity', None)
     col4.metric("현재 ROE", f"{roe_current * 100:.2f}%" if roe_current is not None else "N/A")
 
-    # 💡 섹션 2
+    # ⚖️ 섹션 3: 리스크 및 성과 지표 (신규 추가)
     st.divider()
-    st.subheader("🛡️ 재무 건전성 및 수익성")
+    st.subheader("⚖️ 리스크 및 성과 지표 (최근 1년 기준)")
+    col_risk1, col_risk2, col_risk3, col_risk4 = st.columns(4)
+    
+    col_risk1.metric("베타 (Beta)", f"{beta:.2f}" if pd.notna(beta) else "N/A")
+    col_risk2.metric("샤프 지수 (Sharpe)", f"{sharpe_ratio:.2f}" if pd.notna(sharpe_ratio) else "N/A")
+    col_risk3.metric("CAPM 기대수익률", f"{capm_return * 100:.2f}%" if capm_return is not None else "N/A")
+    col_risk4.metric("무위험 수익률 (10Y)", f"{rfr * 100:.2f}%")
+
+    # 💡 섹션 4: 재무 건전성 및 고급 지표
+    st.divider()
+    st.subheader("🛡️ 재무 건전성 및 기타 지표")
     col_adv1, col_adv2, col_adv3, col_adv4 = st.columns(4)
     
     latest_debt = debt_ratio.iloc[-1] if not debt_ratio.empty else np.nan
@@ -156,7 +198,7 @@ if ticker_symbol:
     col_adv3.metric("ROIC", f"{latest_roic:.2f}%" if pd.notna(latest_roic) else "N/A")
     col_adv4.metric("공매도 비율", f"{short_ratio * 100:.2f}%" if short_ratio else "N/A")
 
-    # 🎯 섹션 3
+    # 🎯 섹션 5: 애널리스트 목표가
     st.divider()
     st.subheader("🎯 월가 컨센서스 목표가")
     col_tgt1, col_tgt2, col_tgt3, col_tgt4 = st.columns(4)
@@ -171,7 +213,7 @@ if ticker_symbol:
     col_tgt3.metric("최저 목표가", format_price(target_low))
     col_tgt4.metric("분석가 수", f"{analyst_cnt}명" if analyst_cnt else "N/A")
 
-    # 🌳 섹션 4 (모바일 스태킹 고려)
+    # 🌳 섹션 6: 듀퐁 분석
     st.divider()
     st.subheader(f"🔬 듀퐁 분석 (ROE 분해) {title_suffix}")
     
@@ -180,7 +222,6 @@ if ticker_symbol:
     latest_em = em.iloc[-1] if not em.empty else 0
     latest_roe = dupont_roe.iloc[-1] if not dupont_roe.empty else 0
 
-    # 모바일에서는 이 컬럼들이 세로로 차곡차곡 예쁘게 쌓입니다.
     col_d1, col_sign1, col_d2, col_sign2, col_d3, col_sign3, col_d4 = st.columns([2, 0.5, 2, 0.5, 2, 0.5, 2])
     col_d1.metric("ROE (자기자본이익률)", f"{latest_roe:.2f}%")
     col_sign1.markdown("<h3 style='text-align: center; margin-top: 10px;'>=</h3>", unsafe_allow_html=True)
@@ -190,22 +231,16 @@ if ticker_symbol:
     col_sign3.markdown("<h3 style='text-align: center; margin-top: 10px;'>×</h3>", unsafe_allow_html=True)
     col_d4.metric("자기자본승수 (레버리지)", f"{latest_em:.2f}배")
 
-    # 📱 차트 여백 최소화 (margin=dict(l=0, r=0, t=30, b=0))
     fig_dupont = make_subplots(specs=[[{"secondary_y": True}]])
     fig_dupont.add_trace(go.Bar(x=dupont_roe.index, y=dupont_roe, name='ROE (%)', opacity=0.6, marker_color='indigo'), secondary_y=False)
     fig_dupont.add_trace(go.Scatter(x=npm.index, y=npm, name='순이익률 (%)', mode='lines+markers', line=dict(color='green', width=2)), secondary_y=False)
     fig_dupont.add_trace(go.Scatter(x=ato.index, y=ato, name='총자산회전율 (배)', mode='lines+markers', line=dict(color='orange', width=2)), secondary_y=True)
     fig_dupont.add_trace(go.Scatter(x=em.index, y=em, name='자기자본승수 (배)', mode='lines+markers', line=dict(color='red', width=2)), secondary_y=True)
     
-    fig_dupont.update_layout(
-        title_text="최근 기간 듀퐁 지표 추이", 
-        hovermode="x unified", barmode='group',
-        margin=dict(l=10, r=10, t=40, b=10), # 모바일 여백 최적화
-        legend=dict(orientation="h", y=-0.2)
-    )
+    fig_dupont.update_layout(title_text="최근 기간 듀퐁 지표 추이", hovermode="x unified", barmode='group', margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
     st.plotly_chart(fig_dupont, use_container_width=True)
 
-    # --- 섹션 5 ---
+    # --- 섹션 7: 수익성 및 현금흐름 차트 ---
     st.divider()
     col_chart1, col_chart2 = st.columns(2)
     
@@ -215,11 +250,7 @@ if ticker_symbol:
         fig_profit.add_trace(go.Bar(x=plot_data_abs.index, y=plot_data_abs['매출액'], name='매출액', marker_color='#1f77b4'))
         fig_profit.add_trace(go.Bar(x=plot_data_abs.index, y=plot_data_abs['영업이익'], name='영업이익', marker_color='#ff7f0e'))
         fig_profit.add_trace(go.Bar(x=plot_data_abs.index, y=plot_data_abs['순이익'], name='순이익', marker_color='#2ca02c'))
-        fig_profit.update_layout(
-            barmode='group', xaxis_type='category', hovermode="x unified", 
-            legend=dict(orientation="h", y=-0.2),
-            margin=dict(l=10, r=10, t=30, b=10) # 모바일 여백 최적화
-        )
+        fig_profit.update_layout(barmode='group', xaxis_type='category', hovermode="x unified", legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig_profit, use_container_width=True)
 
     with col_chart2:
@@ -228,11 +259,7 @@ if ticker_symbol:
         for col in ['CFO(영업활동)', 'CFI(투자활동)', 'CFF(재무활동)', 'CAPEX(자본적지출)', 'FCF(잉여현금)']:
             line_style = dict(dash='dot', width=2) if col == 'CAPEX(자본적지출)' else dict(width=2)
             fig_cf.add_trace(go.Scatter(x=plot_data_abs.index, y=plot_data_abs[col], name=col, mode='lines+markers', line=line_style))
-        fig_cf.update_layout(
-            xaxis_type='category', hovermode="x unified", 
-            legend=dict(orientation="h", y=-0.2),
-            margin=dict(l=10, r=10, t=30, b=10) # 모바일 여백 최적화
-        )
+        fig_cf.update_layout(xaxis_type='category', hovermode="x unified", legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig_cf, use_container_width=True)
 
     detail_df = plot_data_abs.copy()
@@ -240,6 +267,5 @@ if ticker_symbol:
     detail_df['이자보상배율(배)'] = interest_cov
     detail_df['ROIC(%)'] = roic
     
-    # use_container_width=True 로 모바일 화면 꽉 차게 테이블 표시
     with st.expander(f"상세 재무 데이터 보기 (단위: {unit_text})"):
         st.dataframe(detail_df.T.style.format("{:,.2f}"), use_container_width=True)
