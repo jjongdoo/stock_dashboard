@@ -4,11 +4,14 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from pykrx import stock
+import FinanceDataReader as fdr
+import datetime
 
 # 페이지 설정
 st.set_page_config(page_title="나의 주식 분석 대시보드", layout="wide")
 
-# 📱 모바일 UI 최적화를 위한 커스텀 CSS 주입
+# 📱 모바일 UI 최적화 커스텀 CSS
 st.markdown("""
     <style>
     .block-container { padding-top: 2rem; padding-bottom: 2rem; padding-left: 1rem; padding-right: 1rem; }
@@ -17,19 +20,48 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# 🚀 FDR을 이용해 한국 주식 이름-코드 매핑 리스트 캐싱 (속도 최적화)
+@st.cache_data
+def load_krx_mapping():
+    df = fdr.StockListing('KRX')
+    return df[['Code', 'Name', 'Market']]
+
+krx_df = load_krx_mapping()
+
 st.title("📈 주식 재무 데이터 분석기")
 
 # 사이드바 설정
 st.sidebar.header("검색 설정")
-ticker_symbol = st.sidebar.text_input("종목 티커를 입력하세요 (한국: 005930.KS, 미국: AAPL)", "AAPL")
+user_input = st.sidebar.text_input("종목명(한글) 또는 티커(미국) 입력", "삼성전자").strip()
 period_option = st.sidebar.radio("데이터 기간을 선택하세요", ("연간 (최근 3년)", "분기별 (최근 분기 최대 5개)"))
 
-if ticker_symbol:
+if user_input:
+    # 1. 한글 종목명 -> 코드로 스마트 변환 로직
+    matched_row = krx_df[krx_df['Name'] == user_input]
+    
+    if not matched_row.empty:
+        # 한국 주식인 경우
+        pure_ticker = matched_row.iloc[0]['Code']
+        market = matched_row.iloc[0]['Market']
+        # yfinance 조회를 위한 접미사 붙이기
+        suffix = '.KS' if market in ['KOSPI', 'KOSPI200'] else '.KQ'
+        ticker_symbol = pure_ticker + suffix
+        is_korean = True
+        company_name = user_input
+    else:
+        # 미국 주식이거나 티커를 직접 입력한 경우
+        ticker_symbol = user_input.upper()
+        pure_ticker = ticker_symbol.split('.')[0]
+        is_korean = ticker_symbol.endswith('.KS') or ticker_symbol.endswith('.KQ')
+        company_name = ticker_symbol
+
     ticker = yf.Ticker(ticker_symbol)
     stats = ticker.info
 
-    # 1. 한국/미국 주식 단위 설정
-    is_korean = ticker_symbol.endswith('.KS') or ticker_symbol.endswith('.KQ')
+    if 'longName' in stats and not is_korean:
+        company_name = stats['longName']
+
+    # 화폐 단위 설정
     if is_korean:
         divisor = 100_000_000
         unit_text = "억원"
@@ -37,26 +69,74 @@ if ticker_symbol:
         divisor = 1_000_000
         unit_text = "백만 달러"
 
-    # 2. 주가 포맷팅 함수
     def format_price(price):
         if price is None or price == 'N/A' or price == 0 or pd.isna(price):
             return "N/A"
         return f"{price:,.0f}" if price > 1000 else f"{price:,.2f}"
 
-    # 3. 1년 주가 데이터 및 무위험 수익률(미국 10년물 국채) 가져오기
-    hist_1y = ticker.history(period="1y")
-    try:
-        current_price = hist_1y['Close'].iloc[-1]
-    except:
-        current_price = stats.get('currentPrice', 0)
+    # 날짜 세팅
+    today = datetime.datetime.today()
+    start_date_7d = (today - datetime.timedelta(days=7)).strftime("%Y%m%d")
+    end_date_today = today.strftime("%Y%m%d")
+    start_date_1y = (today - datetime.timedelta(days=365)).strftime("%Y%m%d")
 
+    # 2. 데이터 하이브리드 수집 (pykrx + yfinance)
+    hist_1y_fund = pd.DataFrame() # 과거 PER/PBR 담을 변수
+
+    if is_korean:
+        try:
+            # KRX 1년치 시세
+            krx_ohlcv = stock.get_market_ohlcv(start_date_1y, end_date_today, pure_ticker)
+            if not krx_ohlcv.empty:
+                krx_ohlcv.index.name = 'Date'
+                hist_1y = krx_ohlcv.rename(columns={'시가':'Open', '고가':'High', '저가':'Low', '종가':'Close', '거래량':'Volume'})
+                current_price = hist_1y['Close'].iloc[-1]
+            else:
+                hist_1y = pd.DataFrame()
+                current_price = 0
+
+            # KRX 1년치 펀더멘털 (역사적 PER/PBR용)
+            krx_fund = stock.get_market_fundamental(start_date_1y, end_date_today, pure_ticker)
+            if not krx_fund.empty:
+                hist_1y_fund = krx_fund[['PER', 'PBR']].replace(0, np.nan) # 0인 값은 차트에서 끊기도록 nan 처리
+                disp_per = krx_fund['PER'].iloc[-1] if krx_fund['PER'].iloc[-1] > 0 else "N/A"
+                disp_pbr = krx_fund['PBR'].iloc[-1] if krx_fund['PBR'].iloc[-1] > 0 else "N/A"
+            else:
+                disp_per, disp_pbr = "N/A", "N/A"
+
+            # KRX 공매도 비중
+            krx_short = stock.get_shorting_volume_by_ticker(start_date_7d, end_date_today, pure_ticker)
+            if not krx_short.empty and not krx_ohlcv.empty:
+                disp_short = krx_short['공매도거래량'].iloc[-1] / krx_ohlcv['Volume'].iloc[-1]
+            else:
+                disp_short = None
+                
+            disp_roe = stats.get('returnOnEquity', None)
+            
+        except Exception as e:
+            hist_1y = ticker.history(period="1y")
+            current_price = stats.get('currentPrice', hist_1y['Close'].iloc[-1] if not hist_1y.empty else 0)
+            disp_per = stats.get('trailingPE', 'N/A')
+            disp_pbr = stats.get('priceToBook', 'N/A')
+            disp_roe = stats.get('returnOnEquity', None)
+            disp_short = stats.get('shortPercentOfFloat', None)
+    else:
+        # 미국 주식
+        hist_1y = ticker.history(period="1y")
+        current_price = stats.get('currentPrice', hist_1y['Close'].iloc[-1] if not hist_1y.empty else 0)
+        disp_per = stats.get('trailingPE', 'N/A')
+        disp_pbr = stats.get('priceToBook', 'N/A')
+        disp_roe = stats.get('returnOnEquity', None)
+        disp_short = stats.get('shortPercentOfFloat', None)
+
+    # 무위험 수익률
     try:
         rfr_ticker = yf.Ticker("^TNX")
         rfr = rfr_ticker.history(period="1d")['Close'].iloc[-1] / 100
     except:
-        rfr = 0.04  # 데이터 수집 실패 시 기본값 4% 적용
+        rfr = 0.04 
 
-    # 4. 리스크 및 성과 지표 계산 (Sharpe, Beta, CAPM)
+    # 리스크 지표
     if not hist_1y.empty:
         daily_returns = hist_1y['Close'].pct_change().dropna()
         ann_return = daily_returns.mean() * 252
@@ -66,14 +146,10 @@ if ticker_symbol:
         sharpe_ratio = np.nan
 
     beta = stats.get('beta', None)
-    mrp = 0.055  # 시장 위험 프리미엄 5.5% 가정
-    
-    if beta is not None and pd.notna(beta):
-        capm_return = rfr + (beta * mrp)
-    else:
-        capm_return = None
+    mrp = 0.055 
+    capm_return = rfr + (beta * mrp) if (beta is not None and pd.notna(beta)) else None
 
-    # 5. 재무 데이터 불러오기
+    # 3. yfinance 재무 데이터 불러오기
     if period_option == "연간 (최근 3년)":
         fin_data = ticker.financials
         bs_data = ticker.balance_sheet
@@ -89,7 +165,6 @@ if ticker_symbol:
         date_format = '%Y-%m'
         title_suffix = "(분기별)"
 
-    # 데이터 추출 및 시간순 정렬
     df_fin = fin_data.iloc[:, :limit].T.sort_index()
     df_bs = bs_data.iloc[:, :limit].T.sort_index()
     df_cf = cf_data.iloc[:, :limit].T.sort_index()
@@ -143,22 +218,18 @@ if ticker_symbol:
     }) / divisor
 
     # --- 화면 출력 시작 ---
-    company_name = stats.get('longName', ticker_symbol)
     st.markdown(f"## **{company_name} ({ticker_symbol})**")
 
-    # 📈 섹션 1: 1년 캔들차트 (신규 추가)
+    # 📈 섹션 1: 1년 캔들차트
     if not hist_1y.empty:
         fig_candle = go.Figure(data=[go.Candlestick(
             x=hist_1y.index,
-            open=hist_1y['Open'],
-            high=hist_1y['High'],
-            low=hist_1y['Low'],
-            close=hist_1y['Close'],
+            open=hist_1y['Open'], high=hist_1y['High'], low=hist_1y['Low'], close=hist_1y['Close'],
             name="주가"
         )])
         fig_candle.update_layout(
-            title="최근 1년 주가 추이 (Candlestick)",
-            xaxis_rangeslider_visible=False, # 하단 슬라이더 숨김 (모바일 가독성)
+            title="최근 1년 주가 추이",
+            xaxis_rangeslider_visible=False,
             margin=dict(l=10, r=10, t=40, b=10),
             height=400
         )
@@ -168,12 +239,33 @@ if ticker_symbol:
     st.subheader("📌 기본 투자 지표")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("현재 주가", format_price(current_price))
-    col2.metric("현재 PER", f"{stats.get('trailingPE', 'N/A')}")
-    col3.metric("현재 PBR", f"{stats.get('priceToBook', 'N/A')}")
-    roe_current = stats.get('returnOnEquity', None)
-    col4.metric("현재 ROE", f"{roe_current * 100:.2f}%" if roe_current is not None else "N/A")
+    
+    per_val = f"{disp_per:.2f}" if isinstance(disp_per, (int, float)) else "N/A"
+    pbr_val = f"{disp_pbr:.2f}" if isinstance(disp_pbr, (int, float)) else "N/A"
+    roe_val = f"{disp_roe * 100:.2f}%" if disp_roe is not None else "N/A"
+    
+    col2.metric("현재 PER", per_val)
+    col3.metric("현재 PBR", pbr_val)
+    col4.metric("현재 ROE", roe_val)
 
-    # ⚖️ 섹션 3: 리스크 및 성과 지표 (신규 추가)
+    # 📊 섹션 3: 역사적 PER / PBR 추이 (한국 주식 전용)
+    if is_korean and not hist_1y_fund.empty:
+        st.divider()
+        st.subheader("📊 역사적 밸류에이션 추이 (최근 1년)")
+        st.markdown("주가가 기업가치 대비 고평가/저평가 구간 중 어디에 위치해 있는지 파악합니다.")
+        
+        fig_val = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_val.add_trace(go.Scatter(x=hist_1y_fund.index, y=hist_1y_fund['PER'], name='PER (배)', mode='lines', line=dict(color='blue', width=2)), secondary_y=False)
+        fig_val.add_trace(go.Scatter(x=hist_1y_fund.index, y=hist_1y_fund['PBR'], name='PBR (배)', mode='lines', line=dict(color='purple', width=2)), secondary_y=True)
+        
+        fig_val.update_layout(hovermode="x unified", margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", y=-0.2))
+        fig_val.update_yaxes(title_text="PER (배)", secondary_y=False)
+        fig_val.update_yaxes(title_text="PBR (배)", secondary_y=True)
+        st.plotly_chart(fig_val, use_container_width=True)
+    elif not is_korean:
+        st.caption("※ 미국 주식의 과거 PER/PBR 추이는 API 구조상 제공되지 않습니다.")
+
+    # ⚖️ 섹션 4: 리스크 및 성과 지표
     st.divider()
     st.subheader("⚖️ 리스크 및 성과 지표 (최근 1년 기준)")
     col_risk1, col_risk2, col_risk3, col_risk4 = st.columns(4)
@@ -183,7 +275,7 @@ if ticker_symbol:
     col_risk3.metric("CAPM 기대수익률", f"{capm_return * 100:.2f}%" if capm_return is not None else "N/A")
     col_risk4.metric("무위험 수익률 (10Y)", f"{rfr * 100:.2f}%")
 
-    # 💡 섹션 4: 재무 건전성 및 고급 지표
+    # 💡 섹션 5: 재무 건전성 및 기타 지표
     st.divider()
     st.subheader("🛡️ 재무 건전성 및 기타 지표")
     col_adv1, col_adv2, col_adv3, col_adv4 = st.columns(4)
@@ -191,14 +283,15 @@ if ticker_symbol:
     latest_debt = debt_ratio.iloc[-1] if not debt_ratio.empty else np.nan
     latest_icov = interest_cov.iloc[-1] if not interest_cov.empty else np.nan
     latest_roic = roic.iloc[-1] if not roic.empty else np.nan
-    short_ratio = stats.get('shortPercentOfFloat', None)
 
     col_adv1.metric("부채비율", f"{latest_debt:.2f}%" if pd.notna(latest_debt) else "N/A")
     col_adv2.metric("이자보상배율", f"{latest_icov:.2f}배" if pd.notna(latest_icov) else "N/A")
     col_adv3.metric("ROIC", f"{latest_roic:.2f}%" if pd.notna(latest_roic) else "N/A")
-    col_adv4.metric("공매도 비율", f"{short_ratio * 100:.2f}%" if short_ratio else "N/A")
+    
+    short_disp_val = f"{disp_short * 100:.2f}%" if disp_short is not None else "N/A"
+    col_adv4.metric("공매도 비중", short_disp_val)
 
-    # 🎯 섹션 5: 애널리스트 목표가
+    # 🎯 섹션 6: 애널리스트 목표가
     st.divider()
     st.subheader("🎯 월가 컨센서스 목표가")
     col_tgt1, col_tgt2, col_tgt3, col_tgt4 = st.columns(4)
@@ -213,7 +306,7 @@ if ticker_symbol:
     col_tgt3.metric("최저 목표가", format_price(target_low))
     col_tgt4.metric("분석가 수", f"{analyst_cnt}명" if analyst_cnt else "N/A")
 
-    # 🌳 섹션 6: 듀퐁 분석
+    # 🌳 섹션 7: 듀퐁 분석
     st.divider()
     st.subheader(f"🔬 듀퐁 분석 (ROE 분해) {title_suffix}")
     
@@ -240,7 +333,7 @@ if ticker_symbol:
     fig_dupont.update_layout(title_text="최근 기간 듀퐁 지표 추이", hovermode="x unified", barmode='group', margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
     st.plotly_chart(fig_dupont, use_container_width=True)
 
-    # --- 섹션 7: 수익성 및 현금흐름 차트 ---
+    # --- 섹션 8: 수익성 및 현금흐름 차트 ---
     st.divider()
     col_chart1, col_chart2 = st.columns(2)
     
