@@ -42,10 +42,25 @@ period_option = st.sidebar.radio("데이터 기간을 선택하세요", ("연간
 if user_input:
     matched_row = krx_df[krx_df['Name'] == user_input]
 
+    # ── pykrx로 KOSPI/KOSDAQ 시장 자동 판별 ──
+    @st.cache_data(ttl=86400)
+    def get_market_suffix(code):
+        """pykrx로 해당 종목코드가 KOSPI인지 KOSDAQ인지 판별"""
+        try:
+            today_str = datetime.datetime.today().strftime("%Y%m%d")
+            kospi_tickers = stock.get_market_ticker_list(today_str, market="KOSPI")
+            if code in kospi_tickers:
+                return '.KS', 'KOSPI'
+            kosdaq_tickers = stock.get_market_ticker_list(today_str, market="KOSDAQ")
+            if code in kosdaq_tickers:
+                return '.KQ', 'KOSDAQ'
+        except Exception:
+            pass
+        return '.KS', 'KOSPI'  # 기본값
+
     if not matched_row.empty:
         pure_ticker = str(matched_row.iloc[0]['Code'])
-        market = matched_row.iloc[0]['Market']
-        suffix = '.KS' if market in ['KOSPI', 'KOSPI200'] else '.KQ'
+        suffix, market = get_market_suffix(pure_ticker)
         ticker_symbol = pure_ticker + suffix
         is_korean = True
         company_name = user_input
@@ -54,7 +69,7 @@ if user_input:
         pure_ticker = ticker_symbol.split('.')[0]
         is_korean = ticker_symbol.endswith('.KS') or ticker_symbol.endswith('.KQ')
         company_name = ticker_symbol
-        market = 'US'
+        market = 'KOSPI' if ticker_symbol.endswith('.KS') else ('KOSDAQ' if ticker_symbol.endswith('.KQ') else 'US')
 
     ticker = yf.Ticker(ticker_symbol)
     stats = ticker.info
@@ -91,34 +106,47 @@ if user_input:
         pykrx로 월간 주가 + PER/PBR을 받아
         EPS = 주가 ÷ PER, BPS = 주가 ÷ PBR을 역산하고
         각 배수 밴드선을 계산해서 반환합니다.
+        반환: (DataFrame or None, error_message or None)
         """
         try:
-            # 월간 펀더멘털 (PER, PBR 포함)
             fund_m = stock.get_market_fundamental(val_start, val_end, pure_sym, freq="m")
-            # 월간 주가 (Close 사용)
+            if fund_m.empty:
+                return None, f"펀더멘털 데이터 없음 (코드: {pure_sym}, 기간: {val_start}~{val_end})"
+
             ohlcv_m = stock.get_market_ohlcv(val_start, val_end, pure_sym, freq="m")
+            if ohlcv_m.empty:
+                return None, f"주가 OHLCV 데이터 없음 (코드: {pure_sym})"
 
-            if fund_m.empty or ohlcv_m.empty:
-                return None, None
+            # 컬럼명 유연하게 처리 (pykrx 버전에 따라 다를 수 있음)
+            close_col = next((c for c in ['종가', 'Close', 'close'] if c in ohlcv_m.columns), None)
+            if close_col is None:
+                return None, f"종가 컬럼 없음. 실제 컬럼: {list(ohlcv_m.columns)}"
 
-            # 인덱스 기준으로 병합
-            merged = pd.concat([ohlcv_m[['종가']], fund_m[['PER', 'PBR']]], axis=1).dropna()
+            per_col = next((c for c in ['PER', 'per'] if c in fund_m.columns), None)
+            pbr_col = next((c for c in ['PBR', 'pbr'] if c in fund_m.columns), None)
+            if per_col is None or pbr_col is None:
+                return None, f"PER/PBR 컬럼 없음. 실제 컬럼: {list(fund_m.columns)}"
+
+            merged = pd.concat(
+                [ohlcv_m[[close_col]].rename(columns={close_col: '종가'}),
+                 fund_m[[per_col, pbr_col]].rename(columns={per_col: 'PER', pbr_col: 'PBR'})],
+                axis=1
+            ).dropna()
             merged = merged[(merged['PER'] > 0) & (merged['PBR'] > 0)]
 
             if merged.empty:
-                return None, None
+                return None, "PER/PBR 유효 데이터 없음 (0 또는 NaN만 존재)"
 
-            # EPS, BPS 역산
             merged['EPS'] = merged['종가'] / merged['PER']
             merged['BPS'] = merged['종가'] / merged['PBR']
-
-            # EPS/BPS 스무딩 (3개월 이동평균 → 밴드가 매끄럽게 보임)
             merged['EPS_smooth'] = merged['EPS'].rolling(3, min_periods=1).mean()
             merged['BPS_smooth'] = merged['BPS'].rolling(3, min_periods=1).mean()
 
             return merged, None
+
         except Exception as e:
-            return None, str(e)
+            import traceback
+            return None, f"예외 발생: {str(e)} | {traceback.format_exc()}"
 
     @st.cache_data(ttl=3600)
     def get_stock_data(symbol, pure_sym, is_kr, val_start):
@@ -440,8 +468,10 @@ if user_input:
                     col_s6.metric(f"{band_title} 범위 PBR", f"{pbr_hist_min:.2f} ~ {pbr_hist_max:.2f}x")
 
             else:
-                st.warning(f"⚠️ pykrx에서 밴드 데이터를 불러오지 못했습니다. {err_msg or '데이터 없음'}")
-                st.info("💡 종목 코드나 날짜 범위를 확인해보세요.")
+                st.warning(f"⚠️ pykrx에서 밴드 데이터를 불러오지 못했습니다.")
+                with st.expander("🔍 디버그 정보 보기"):
+                    st.code(err_msg or "에러 메시지 없음 (데이터가 비어있음)")
+                    st.write(f"종목코드: `{pure_ticker}`, 기간: `{start_val_date}` ~ `{end_date_today}`")
 
         else:
             st.info("💡 미국 주식은 야후 파이낸스 무료 API 구조상 과거 장기 EPS/BPS를 불러올 수 없어 밸류에이션 밴드 차트가 생략됩니다.")
